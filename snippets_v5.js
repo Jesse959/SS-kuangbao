@@ -12,9 +12,9 @@ const ATYPE_IPV4 = 1;
 const ATYPE_DOMAIN = 2;
 const ATYPE_IPV6 = 3;
 
-const WS_HIGH_WATER = 49152;
+const WS_HIGH_WATER = 32768;
 const WS_BACKOFF_MS = 2;
-const CONNECT_TIMEOUT = 2000;
+const CONNECT_TIMEOUT = 3000;
 
 const textDecoder = new TextDecoder();
 const EMPTY_BYTES = new Uint8Array(0);
