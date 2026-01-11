@@ -11,8 +11,12 @@ const PROXY_PORT = 443;
 const WS_HI = 32768;
 const WS_LO = 16384;
 const MERGE_MAX = 16384;
-const BATCH = 8;
+const BATCH_HI = 8;
+const BATCH_LO = 2;
+const BP_LIMIT = 20;
 const TIMEOUT = 2000;
+const Q_MAX = 32;
+const QB_MAX = 262144;
 
 const DEC = new TextDecoder();
 const EMPTY = new Uint8Array(0);
@@ -80,7 +84,7 @@ function chkUUID(d, o) {
   );
 }
 
-// ============ VLESS 解析 ============
+// ============ VLESS 解析（保留数组 join - 已验证更快） ============
 function parseVL(d) {
   const result = new VLESSResult();
   const len = d.length | 0;
@@ -121,16 +125,17 @@ function parseVL(d) {
     end = (aoff + 17) | 0;
     if (end > len) return VFAIL;
     const v = new DataView(d.buffer, d.byteOffset + aoff + 1, 16);
-    host = [
-      v.getUint16(0).toString(16),
-      v.getUint16(2).toString(16),
-      v.getUint16(4).toString(16),
-      v.getUint16(6).toString(16),
-      v.getUint16(8).toString(16),
-      v.getUint16(10).toString(16),
-      v.getUint16(12).toString(16),
-      v.getUint16(14).toString(16)
-    ].join(':');
+    // 保留数组 join - 单次分配，单次拼接
+    const parts = new Array(8);
+    parts[0] = v.getUint16(0).toString(16);
+    parts[1] = v.getUint16(2).toString(16);
+    parts[2] = v.getUint16(4).toString(16);
+    parts[3] = v.getUint16(6).toString(16);
+    parts[4] = v.getUint16(8).toString(16);
+    parts[5] = v.getUint16(10).toString(16);
+    parts[6] = v.getUint16(12).toString(16);
+    parts[7] = v.getUint16(14).toString(16);
+    host = parts.join(':');
   } else {
     return VFAIL;
   }
@@ -164,7 +169,7 @@ async function dial(host, port, fb) {
   return sock;
 }
 
-// ============ 状态 ============
+// ============ 状态（固定形状，无动态方法） ============
 function State(ws, tcp) {
   this.ws = ws;
   this.tcp = tcp;
@@ -186,7 +191,7 @@ State.prototype.kill = function() {
   });
 };
 
-// ============ 上行 ============
+// ============ 上行（纯优化：窗口批量，无额外状态） ============
 function Uplink(s, w) {
   this.s = s;
   this.w = w;
@@ -196,42 +201,62 @@ function Uplink(s, w) {
 }
 
 Uplink.prototype.push = function(chunk) {
-  if (this.s.dead) return;
+  const s = this.s;
+  if (s.dead) return;
   
   const len = chunk.length | 0;
+  const qlen = this.q.length | 0;
+  const qb = this.qb | 0;
   
-  if (this.q.length >= 32 || this.qb > 262144) {
-    this.s.kill();
+  if (qlen >= Q_MAX || qb > QB_MAX) {
+    s.kill();
     return;
   }
   
   this.q.push(chunk);
-  this.qb = (this.qb + len) | 0;
+  this.qb = (qb + len) | 0;
   
-  if (!this.lock && (len > 8192 || this.qb >= MERGE_MAX)) {
-    this.flush();
+  const flush = len > 8192 || this.qb >= MERGE_MAX || qlen >= 15;
+  
+  if (!this.lock && flush) {
+    this.drain();
   } else if (!this.lock) {
-    queueMicrotask(() => this.flush());
+    const self = this;
+    queueMicrotask(() => self.drain());
   }
 };
 
-Uplink.prototype.flush = async function() {
+Uplink.prototype.drain = async function() {
   if (this.lock || this.s.dead || this.q.length === 0) return;
   
   this.lock = true;
+  const s = this.s;
+  const w = this.w;
+  const q = this.q;
   
-  while (this.q.length > 0 && !this.s.dead) {
-    const batch = this.q.splice(0, this.q.length);
-    const total = this.qb | 0;
-    this.qb = 0;
+  while (q.length > 0 && !s.dead) {
+    const qlen = q.length | 0;
+    
+    let bc = 0;
+    let bb = 0;
+    
+    for (let i = 0; i < qlen && bc < 16; i = (i + 1) | 0) {
+      const clen = q[i].length | 0;
+      if (bb > 0 && (bb + clen) > MERGE_MAX) break;
+      bb = (bb + clen) | 0;
+      bc = (bc + 1) | 0;
+    }
+    
+    const batch = q.splice(0, bc);
+    this.qb = (this.qb - bb) | 0;
     
     let data;
-    if (batch.length === 1) {
+    if (bc === 1) {
       data = batch[0];
     } else {
-      data = new Uint8Array(total);
+      data = new Uint8Array(bb);
       let off = 0;
-      for (let i = 0; i < batch.length; i = (i + 1) | 0) {
+      for (let i = 0; i < bc; i = (i + 1) | 0) {
         const c = batch[i];
         data.set(c, off);
         off = (off + c.length) | 0;
@@ -239,11 +264,11 @@ Uplink.prototype.flush = async function() {
     }
     
     try {
-      await this.w.ready;
-      if (this.s.dead) break;
-      await this.w.write(data);
+      await w.ready;
+      if (s.dead) break;
+      await w.write(data);
     } catch {
-      this.s.kill();
+      s.kill();
       break;
     }
   }
@@ -251,16 +276,16 @@ Uplink.prototype.flush = async function() {
   this.lock = false;
 };
 
-// ============ 下行（修复：移除 setTimeout 退化） ============
+// ============ 下行（纯优化：限制轮询，无缓冲池） ============
 function Downlink(s, ws, r) {
   this.s = s;
   this.ws = ws;
   this.r = r;
   this.first = true;
-  this.pump();
+  this.run();
 }
 
-Downlink.prototype.pump = async function() {
+Downlink.prototype.run = async function() {
   const s = this.s;
   const ws = this.ws;
   const r = this.r;
@@ -268,27 +293,32 @@ Downlink.prototype.pump = async function() {
   
   try {
     while (!s.dead) {
-      // 精确背压（避免递归爆炸和固定延迟）
       let buf = ws.bufferedAmount | 0;
+      
       if (buf > WS_HI) {
-        await new Promise(resolve => {
-          const check = () => {
+        let cnt = 0;
+        await new Promise(res => {
+          const chk = () => {
             if (s.dead || ws.bufferedAmount < WS_LO) {
-              resolve();
+              res();
+              return;
+            }
+            cnt = (cnt + 1) | 0;
+            if (cnt > BP_LIMIT) {
+              setTimeout(res, 1);
             } else {
-              queueMicrotask(check);
+              queueMicrotask(chk);
             }
           };
-          check();
+          chk();
         });
         if (s.dead) break;
       }
       
-      // 动态批量
       buf = ws.bufferedAmount | 0;
-      const quantum = (buf < WS_LO ? BATCH : 2) | 0;
+      const qt = (buf < WS_LO) ? BATCH_HI : BATCH_LO;
       
-      for (let i = 0; i < quantum && !s.dead; i = (i + 1) | 0) {
+      for (let i = 0; i < qt && !s.dead; i = (i + 1) | 0) {
         const {done, value} = await r.read();
         
         if (done || s.dead) {
